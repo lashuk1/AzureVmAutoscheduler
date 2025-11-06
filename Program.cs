@@ -1,137 +1,298 @@
 ﻿using System.Collections.Concurrent;
-using Azure;
+using System.Globalization;
+using System.Text;
 using Azure.Identity;
 using Azure.ResourceManager;
 using Azure.ResourceManager.Compute;
-using Azure.ResourceManager.Compute.Models;
 using Azure.ResourceManager.Resources;
-using System.Globalization; 
 
+#region Config
+string CsvPath = Env("CSV_PATH", "vm-log.csv");
+int PollMinutes = Math.Max(1, Int("POLL_MINUTES", 5));
+int MaxDop = Math.Max(1, Int("MAX_DOP", 8));
+double RunningLimitHours = DoubleInv("RUNNING_LIMIT_HOURS", 8.0);
+bool DryRun = Bool("DRY_RUN", false);
 
-string CsvPath = Environment.GetEnvironmentVariable("CSV_PATH") ?? "vm-log.csv";
-int PollMinutes = int.TryParse(Environment.GetEnvironmentVariable("POLL_MINUTES"), out var pm) ? pm : 5;
-bool DryRun = string.Equals(Environment.GetEnvironmentVariable("DRY_RUN"), "true", StringComparison.OrdinalIgnoreCase);
-double RunningLimitHours = double.TryParse(Environment.GetEnvironmentVariable("RUNNING_LIMIT_HOURS"), 
-    NumberStyles.Float, CultureInfo.InvariantCulture, 
-    out var h
-) ? h : 8.0;
-
-Console.WriteLine($"[{DateTime.UtcNow:HH:mm:ss}] Azure VM Autoscheduler started");
-Console.WriteLine($"CSV_PATH={CsvPath}, POLL_MINUTES={PollMinutes}, DRY_RUN={DryRun}, RUNNING_LIMIT_HOURS={RunningLimitHours}");
-
-var seenRunning = new ConcurrentDictionary<string, DateTime>();
-await EnsureHeaderAsync(CsvPath);
+static string Env(string k, string d) => Environment.GetEnvironmentVariable(k) ?? d;
+static int Int(string k, int d) => int.TryParse(Env(k, ""), out var v) ? v : d;
+static double DoubleInv(string k, double d)
+    => double.TryParse(Env(k, ""), NumberStyles.Float, CultureInfo.InvariantCulture, out var v) ? v : d;
+static bool Bool(string k, bool d)
+    => bool.TryParse(Env(k, ""), out var v) ? v : d;
+#endregion
 
 var cts = new CancellationTokenSource();
 Console.CancelKeyPress += (_, e) => { e.Cancel = true; cts.Cancel(); };
 
-while (!cts.IsCancellationRequested)
+Console.WriteLine($"{Now()} Azure VM Autoscheduler starting…");
+Console.WriteLine($"{Now()} CSV_PATH={CsvPath}, POLL_MINUTES={PollMinutes}, MAX_DOP={MaxDop}, RUNNING_LIMIT_HOURS={RunningLimitHours}, DRY_RUN={DryRun}");
+
+await EnsureCsvHeaderAsync(CsvPath, cts.Token);
+
+var firstSeenRunningUtc = new ConcurrentDictionary<string, DateTimeOffset>(StringComparer.OrdinalIgnoreCase);
+var csvLock = new SemaphoreSlim(1, 1);
+
+var credential = new DefaultAzureCredential();
+var arm = new ArmClient(credential);
+
+var timer = new PeriodicTimer(TimeSpan.FromMinutes(PollMinutes));
+while (true)
 {
     try
     {
-        await PollAsync(CsvPath, seenRunning, RunningLimitHours, DryRun);
+        await PollOnceAsync(arm, CsvPath, firstSeenRunningUtc, csvLock, RunningLimitHours, DryRun, MaxDop, cts.Token);
+    }
+    catch (OperationCanceledException) when (cts.IsCancellationRequested)
+    {
+        Console.WriteLine($"{Now()} Cancellation requested. Exiting.");
+        break;
     }
     catch (Exception ex)
     {
-        Console.WriteLine($"[{DateTime.UtcNow:HH:mm:ss}] ERROR: {ex.Message}");
+        Console.WriteLine($"{Now()} ERROR (top-level): {ex}");
     }
 
     try
     {
-        await Task.Delay(TimeSpan.FromMinutes(PollMinutes), cts.Token);
+        await timer.WaitForNextTickAsync(cts.Token);
     }
     catch (OperationCanceledException)
     {
+        Console.WriteLine($"{Now()} Stopped.");
         break;
     }
 }
 
-static async Task PollAsync(
+async Task PollOnceAsync(
+    ArmClient armClient,
     string csvPath,
-    ConcurrentDictionary<string, DateTime> seen,
-    double limitHrs,
-    bool dryRun)
+    ConcurrentDictionary<string, DateTimeOffset> firstSeenRunning,
+    SemaphoreSlim csvLock,
+    double runningLimitHours,
+    bool dryRun,
+    int maxDop,
+    CancellationToken ct)
 {
-    var arm = new ArmClient(new DefaultAzureCredential());
+    Console.WriteLine($"{Now()} Polling…");
 
-    foreach (var sub in arm.GetSubscriptions().GetAll())
+    var subs = armClient.GetSubscriptions().GetAllAsync();
+
+    var subGate = new SemaphoreSlim(maxDop);
+    var subTasks = new List<Task>();
+
+    await foreach (var sub in subs)
     {
-        Console.WriteLine($"[{DateTime.UtcNow:HH:mm:ss}] Checking subscription {sub.Data.DisplayName}");
-
-        foreach (var vm in sub.GetVirtualMachines())
+        await subGate.WaitAsync(ct);
+        subTasks.Add(Task.Run(async () =>
         {
             try
             {
-                var vmData = vm.Data;
-                string vmId = vm.Id;
-                string rg = vm.Id.ResourceGroupName;
-                string name = vmData.Name;
-                string subId = vm.Id.SubscriptionId;
-                string powerDisplay = "";
+                await ProcessSubscriptionAsync(sub, csvPath, firstSeenRunning, csvLock, runningLimitHours, dryRun, maxDop, ct);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"{Now()} [Sub:{sub.Data.SubscriptionId}] ERROR: {ex.Message}");
+            }
+            finally
+            {
+                subGate.Release();
+            }
+        }));
+    }
 
-                bool hasAuto = vmData.Tags.TryGetValue("Autoshutdown", out var tagVal) && tagVal == "1";
+    await Task.WhenAll(subTasks);
+}
 
-                if (hasAuto)
+async Task ProcessSubscriptionAsync(
+    SubscriptionResource subscription,
+    string csvPath,
+    ConcurrentDictionary<string, DateTimeOffset> firstSeenRunning,
+    SemaphoreSlim csvLock,
+    double runningLimitHours,
+    bool dryRun,
+    int maxDop,
+    CancellationToken ct)
+{
+    Console.WriteLine($"{Now()} Subscription: {subscription.Data.DisplayName} ({subscription.Data.SubscriptionId})");
+
+    var vmGate = new SemaphoreSlim(maxDop);
+    var vmTasks = new List<Task>();
+
+    var rgCollection = subscription.GetResourceGroups();
+    await foreach (var rg in rgCollection.GetAllAsync())
+    {
+        var vmCollection = rg.GetVirtualMachines();
+        await foreach (var vm in vmCollection.GetAllAsync())
+        {
+            await vmGate.WaitAsync(ct);
+            vmTasks.Add(Task.Run(async () =>
+            {
+                try
                 {
-                    
-                    var vmWithIv = await vm.GetAsync(expand: InstanceViewType.InstanceView);
-                    var iv = vmWithIv.Value.Data.InstanceView;
-                    powerDisplay = iv?.Statuses?
-                        .FirstOrDefault(s => s.Code != null && s.Code.StartsWith("PowerState/", StringComparison.OrdinalIgnoreCase))
-                        ?.DisplayStatus ?? "Unknown";
+                    await ProcessVmAsync(vm, csvPath, firstSeenRunning, csvLock, runningLimitHours, dryRun, ct);
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"{Now()} [VM:{vm.Id}] ERROR: {ex.Message}");
+                }
+                finally
+                {
+                    vmGate.Release();
+                }
+            }));
+        }
+    }
+    await Task.WhenAll(vmTasks);
+}
 
+async Task ProcessVmAsync(
+    VirtualMachineResource vm,
+    string csvPath,
+    ConcurrentDictionary<string, DateTimeOffset> firstSeenRunning,
+    SemaphoreSlim csvLock,
+    double runningLimitHours,
+    bool dryRun,
+    CancellationToken ct)
+{
+    var id = vm.Id;
+    var subId = id.SubscriptionId ?? "";
+    var rg = id.ResourceGroupName ?? "";
+    var data = vm.Data;
+    if (data is null)
+    {
+        Console.WriteLine($"{Now()} [VM:{id}] Missing Data");
+        return;
+    }
+    var computerName = data.OSProfile?.ComputerName ?? data.Name ?? "";
 
-                    if (IsRunning(powerDisplay))
+    var hasAuto = data.Tags != null
+        && data.Tags.TryGetValue("Autoshutdown", out var tagVal)
+        && tagVal == "1";
+
+    string powerDisplay = ""; 
+
+    try
+    {
+        if (hasAuto)
+        {
+            var ivResp = await vm.InstanceViewAsync(ct);
+            powerDisplay = ivResp.Value?.Statuses?
+                .FirstOrDefault(s => s.Code != null && s.Code.StartsWith("PowerState/", StringComparison.OrdinalIgnoreCase))
+                ?.DisplayStatus ?? "Unknown";
+
+            var key = id.ToString();
+
+            if (IsRunning(powerDisplay))
+            {
+                var now = DateTimeOffset.UtcNow;
+                var first = firstSeenRunning.GetOrAdd(key, now);
+                var runningFor = now - first;
+
+                if (runningFor > TimeSpan.FromHours(runningLimitHours))
+                {
+                    Console.WriteLine($"{Now()} [{computerName}] Running {runningFor.TotalHours:F1}h > {runningLimitHours}h → PowerOff {(dryRun ? "(DRY RUN)" : "")}");
+                    if (!dryRun)
                     {
-                        var now = DateTime.UtcNow;
-                        var first = seen.GetOrAdd(vmId, now);
-                        var runningHrs = (now - first).TotalHours;
-
-                        if (runningHrs > limitHrs)
+                        try
                         {
-                            Console.WriteLine($"[{DateTime.UtcNow:HH:mm:ss}] {name} running {runningHrs:F2}h > {limitHrs}h → PowerOff {(dryRun ? "(dry)" : "")}");
-                            if (!dryRun)
-                                await vm.PowerOffAsync(WaitUntil.Completed, false);
-                            seen.TryRemove(vmId, out _);
+                            await vm.PowerOffAsync(
+                                waitUntil: Azure.WaitUntil.Completed,
+                                skipShutdown: false,
+                                cancellationToken: ct);
+                        }
+                        catch (Exception ex)
+                        {
+                            Console.WriteLine($"{Now()} [{computerName}] PowerOff failed: {ex.Message}");
                         }
                     }
-                    else
+
+                    firstSeenRunning.TryRemove(key, out _);
+                }
+            }
+            else
+            {
+                firstSeenRunning.TryRemove(key, out _);
+                
+                if (IsStoppedAllocated(powerDisplay))
+                {
+                    Console.WriteLine($"{Now()} [{computerName}] Stopped (allocated) → Deallocate {(dryRun ? "(DRY RUN)" : "")}");
+                    if (!dryRun)
                     {
-                        seen.TryRemove(vmId, out _);
-                        if (IsStoppedAllocated(powerDisplay))
+                        try
                         {
-                            Console.WriteLine($"[{DateTime.UtcNow:HH:mm:ss}] {name} stopped (allocated) → Deallocate {(dryRun ? "(dry)" : "")}");
-                            if (!dryRun)
-                                await vm.DeallocateAsync(WaitUntil.Completed);
+                            await vm.DeallocateAsync(
+                                waitUntil: Azure.WaitUntil.Completed,
+                                cancellationToken: ct);
+                            powerDisplay = "Deallocated";
+                        }
+                        catch (Exception ex)
+                        {
+                            Console.WriteLine($"{Now()} [{computerName}] Deallocate failed: {ex.Message}");
                         }
                     }
                 }
-
-                await AppendCsvAsync(csvPath, DateTime.UtcNow, subId, rg, name, powerDisplay);
-            }
-            catch (Exception exVm)
-            {
-                Console.WriteLine($"[{DateTime.UtcNow:HH:mm:ss}] VM ERROR: {exVm.Message}");
             }
         }
+        else
+        {
+            firstSeenRunning.TryRemove(id.ToString(), out _);
+        }
+    }
+    catch (OperationCanceledException) { throw; }
+    catch (Exception exVm)
+    {
+        Console.WriteLine($"{Now()} [{computerName}] VM processing error: {exVm.Message}");
+    }
+
+    await AppendCsvAsync(csvPath, csvLock, new[]
+    {
+        DateTimeOffset.UtcNow.UtcDateTime.ToString("o", CultureInfo.InvariantCulture),
+        subId,
+        rg,
+        computerName,
+        powerDisplay 
+    }, ct);
+}
+
+bool IsRunning(string display)
+    => display.Contains("running", StringComparison.OrdinalIgnoreCase);
+
+bool IsStoppedAllocated(string display)
+    => display.Contains("stopped", StringComparison.OrdinalIgnoreCase)
+       && !display.Contains("deallocated", StringComparison.OrdinalIgnoreCase);
+
+async Task EnsureCsvHeaderAsync(string path, CancellationToken ct)
+{
+    if (!File.Exists(path))
+    {
+        await AppendCsvAsync(path, new SemaphoreSlim(1, 1), new[]
+        {
+            "TimestampUtc","SubscriptionId","ResourceGroup","ComputerName","PowerStateIfAutoShutdown"
+        }, ct);
     }
 }
 
-static bool IsRunning(string display) =>
-    display.Contains("running", StringComparison.OrdinalIgnoreCase);
-
-static bool IsStoppedAllocated(string display) =>
-    display.Contains("stopped", StringComparison.OrdinalIgnoreCase)
-    && !display.Contains("deallocated", StringComparison.OrdinalIgnoreCase);
-
-static async Task EnsureHeaderAsync(string path)
+async Task AppendCsvAsync(string path, SemaphoreSlim csvLock, string[] fields, CancellationToken ct)
 {
-    if (!File.Exists(path))
-        await File.WriteAllTextAsync(path, "TimestampUtc,SubscriptionId,ResourceGroup,ComputerName,PowerState\n");
+    static string Esc(string v)
+    {
+        if (string.IsNullOrEmpty(v)) return "";
+        var needsQuotes = v.Contains(',') || v.Contains('"') || v.Contains('\n') || v.Contains('\r');
+        if (!needsQuotes) return v;
+        return "\"" + v.Replace("\"", "\"\"") + "\"";
+    }
+
+    var line = string.Join(",", fields.Select(Esc)) + Environment.NewLine;
+
+    await csvLock.WaitAsync(ct);
+    try
+    {
+        await File.AppendAllTextAsync(path, line, new UTF8Encoding(false), ct);
+    }
+    finally
+    {
+        csvLock.Release();
+    }
 }
 
-static Task AppendCsvAsync(string path, DateTime tsUtc, string subId, string rg, string name, string state)
-{
-    var line = $"{tsUtc:o},{subId},{rg},{name},{state}\n";
-    return File.AppendAllTextAsync(path, line);
-}
+string Now() => $"[{DateTimeOffset.UtcNow:yyyy-MM-dd HH:mm:ss 'UTC'}]";
